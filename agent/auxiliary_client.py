@@ -338,7 +338,7 @@ class _AnthropicCompletionsAdapter:
         model = kwargs.get("model", self._model)
         tools = kwargs.get("tools")
         tool_choice = kwargs.get("tool_choice")
-        max_tokens = kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or 2000
+        max_tokens=kwargs.get("max_tokens") or kwargs.get("max_completion_tokens") or 2000
         temperature = kwargs.get("temperature")
 
         normalized_tool_choice = None
@@ -362,6 +362,14 @@ class _AnthropicCompletionsAdapter:
         )
         if temperature is not None:
             anthropic_kwargs["temperature"] = temperature
+
+        # GLM vision compat: z.ai's Anthropic adapter for glm-4.6v silently
+        # drops image content blocks.  Inline them as data-URL markdown so
+        # GLM can actually see the images.
+        if "glm" in model.lower() and "v" in model.lower():
+            from agent.anthropic_adapter import _glm_vision_inline_images
+            anthropic_msgs = anthropic_kwargs.get("messages", [])
+            anthropic_kwargs["messages"] = _glm_vision_inline_images(anthropic_msgs)
 
         response = self._client.messages.create(**anthropic_kwargs)
         assistant_message, finish_reason = normalize_anthropic_response(response)
@@ -661,6 +669,39 @@ def _try_codex() -> Tuple[Optional[Any], Optional[str]]:
     logger.debug("Auxiliary client: Codex OAuth (%s via Responses API)", _CODEX_AUX_MODEL)
     real_client = OpenAI(api_key=codex_token, base_url=_CODEX_AUX_BASE_URL)
     return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
+
+
+def _try_zai() -> Tuple[Optional[Any], Optional[str]]:
+    """Try z.ai (GLM) as a vision backend using GLM-4.6V via Anthropic-compatible endpoint."""
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+    except ImportError:
+        return None, None
+
+    pconfig = PROVIDER_REGISTRY.get("zai")
+    if not pconfig or pconfig.auth_type != "api_key":
+        return None, None
+
+    api_key = None
+    for env_var in pconfig.api_key_env_vars:
+        val = os.getenv(env_var, "").strip()
+        if val:
+            api_key = val
+            break
+    if not api_key:
+        return None, None
+
+    base_url = "https://api.z.ai/api/anthropic"
+    model_name = "glm-4.6v"
+
+    try:
+        from agent.anthropic_adapter import build_anthropic_client
+    except ImportError:
+        return None, None
+
+    real_client = build_anthropic_client(api_key, base_url)
+    logger.debug("Auxiliary vision client: z.ai Anthropic-compatible (%s)", model_name)
+    return AnthropicAuxiliaryClient(real_client, model_name, api_key, base_url), model_name
 
 
 def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
@@ -1050,6 +1091,7 @@ def get_async_text_auxiliary_client(task: str = ""):
 
 
 _VISION_AUTO_PROVIDER_ORDER = (
+    "zai",
     "openrouter",
     "nous",
     "openai-codex",
@@ -1069,6 +1111,8 @@ def _normalize_vision_provider(provider: Optional[str]) -> str:
 
 def _resolve_strict_vision_backend(provider: str) -> Tuple[Optional[Any], Optional[str]]:
     provider = _normalize_vision_provider(provider)
+    if provider == "zai":
+        return _try_zai()
     if provider == "openrouter":
         return _try_openrouter()
     if provider == "nous":

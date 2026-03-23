@@ -13,6 +13,7 @@ Auth supports:
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 from hermes_constants import get_hermes_home
@@ -593,9 +594,10 @@ def normalize_model_name(model: str, preserve_dots: bool = False) -> str:
     if lower.startswith("anthropic/"):
         model = model[len("anthropic/"):]
     if not preserve_dots:
-        # OpenRouter uses dots for version separators (claude-opus-4.6),
-        # Anthropic uses hyphens (claude-opus-4-6). Convert dots to hyphens.
-        model = model.replace(".", "-")
+        # Only convert dots to hyphens for Anthropic/Claude models.
+        # Other providers (e.g. GLM) use dots in model names (glm-4.6v).
+        if "claude" in model.lower():
+            model = model.replace(".", "-")
     return model
 
 
@@ -734,6 +736,55 @@ def _convert_content_part_to_anthropic(part: Any) -> Optional[Dict[str, Any]]:
     if isinstance(part.get("cache_control"), dict) and "cache_control" not in block:
         block["cache_control"] = dict(part["cache_control"])
     return block
+
+
+def _glm_vision_inline_images(messages: List[Dict]) -> List[Dict]:
+    """Convert Anthropic image blocks to inline data-URL markdown for GLM models.
+
+    z.ai's Anthropic-compatible adapter for glm-4.6v silently ignores
+    ``{"type": "image", "source": {"type": "base64", ...}}`` content blocks.
+    The only way to get GLM to process images is to embed them as data-URL
+    markdown inside text content:
+
+        {"type": "text", "text": "...\\n![image](data:image/jpeg;base64,...)"}
+
+    This transform rewrites messages in-place so the adapter's normal path
+    (build_anthropic_kwargs → convert_messages_to_anthropic) still runs, but
+    the image blocks become text-embedded references.
+    """
+    _IMAGE_BLOCK = re.compile(r"^image$")
+
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+
+        new_parts: List[Dict[str, Any]] = []
+        for part in content:
+            if isinstance(part, dict) and _IMAGE_BLOCK.match(part.get("type", "")):
+                source = part.get("source", {})
+                if source.get("type") == "base64" and source.get("data"):
+                    media = source.get("media_type", "image/jpeg")
+                    data_url = f"data:{media};base64,{source['data']}"
+                    new_parts.append({
+                        "type": "text",
+                        "text": f"![image]({data_url})",
+                    })
+                elif source.get("type") == "url" and source.get("url"):
+                    new_parts.append({
+                        "type": "text",
+                        "text": f"![image]({source['url']})",
+                    })
+                else:
+                    # Unknown source format — drop the block
+                    pass
+            else:
+                new_parts.append(part)
+
+        if new_parts:
+            msg["content"] = new_parts
+
+    return messages
 
 
 def _convert_content_to_anthropic(content: Any) -> Any:
