@@ -1849,7 +1849,8 @@ class DiscordAdapter(BasePlatformAdapter):
 
     async def send_exec_approval(
         self, chat_id: str, command: str, approval_id: str,
-        on_resolve: callable = None, thread_id: str = None
+        on_resolve: callable = None, thread_id: str = None,
+        source_info: str = None
     ) -> SendResult:
         """
         Send a button-based exec approval prompt for a dangerous command.
@@ -1873,6 +1874,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 description=f"```\n{cmd_display}\n```",
                 color=discord.Color.orange(),
             )
+            if source_info:
+                embed.add_field(name="Source", value=source_info, inline=False)
             embed.set_footer(text=f"Approval ID: {approval_id}")
 
             view = ExecApprovalView(

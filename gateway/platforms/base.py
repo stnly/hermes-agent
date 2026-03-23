@@ -571,6 +571,7 @@ class BasePlatformAdapter(ABC):
         approval_id: str,
         on_resolve: "callable" = None,
         thread_id: str = None,
+        source_info: str = None,
     ) -> SendResult:
         """
         Send an interactive approval prompt for a dangerous command.
