@@ -75,6 +75,41 @@ DANGEROUS_PATTERNS = [
     (r'\b(cp|mv|install)\b.*\s/etc/', "copy/move file into /etc/"),
     (r'\bsed\s+-[^\s]*i.*\s/etc/', "in-place edit of system config"),
     (r'\bsed\s+--in-place\b.*\s/etc/', "in-place edit of system config (long flag)"),
+    # --- Terminal writes to cron jobs.json (use cronjob tool instead) ---
+    # Catches shell redirect (> or >>) to jobs.json
+    (r'>>?\s*.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/cron/jobs\.json',
+     "write to cron jobs.json (use cronjob tool instead)"),
+    # Catches tee writing to jobs.json
+    (r'\btee\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/cron/jobs\.json',
+     "write to cron jobs.json via tee (use cronjob tool instead)"),
+    # Catches python/perl/node -c/-e scripts writing to jobs.json
+    (r'\b(python[23]?|perl|node)\s+-[ce]\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/cron/jobs\.json',
+     "write to cron jobs.json via script (use cronjob tool instead)"),
+    # Catches jq modifying/writing jobs.json
+    (r'\bjq\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/cron/jobs\.json',
+     "modify cron jobs.json via jq (use cronjob tool instead)"),
+    # Catches cp/mv overwriting jobs.json
+    (r'\b(cp|mv)\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/cron/jobs\.json',
+     "overwrite cron jobs.json via cp/mv (use cronjob tool instead)"),
+    # Catches sed -i editing jobs.json
+    (r'\bsed\s+-i\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/cron/jobs\.json',
+     "edit cron jobs.json via sed (use cronjob tool instead)"),
+    # --- Memory protection (qmd-memory, memory store) ---
+    # Catches rm targeting QMD memory directory
+    (r'\brm\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/qmd-memory',
+     "delete QMD memory files (use memory/qmd tools instead)"),
+    # Catches rm targeting persistent memory directory
+    (r'\brm\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/memory',
+     "delete persistent memory files (use memory tool instead)"),
+    # Catches find -delete targeting memory directories
+    (r'\bfind\b.*-delete\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/(qmd-memory|memory)',
+     "find -delete on memory directory"),
+    # Catches shell redirect overwriting memory files
+    (r'>>?\s*.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/(qmd-memory|memory)/',
+     "overwrite memory file via redirect"),
+    # Catches tee overwriting memory files
+    (r'\btee\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/(qmd-memory|memory)/',
+     "overwrite memory file via tee"),
 ]
 
 

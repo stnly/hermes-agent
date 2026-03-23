@@ -312,12 +312,41 @@ def notify_other_tool_call(task_id: str = "default"):
             task_data["consecutive"] = 0
 
 
+def _is_protected_cron_path(path: str) -> bool:
+    """Return True if *path* points at the cron jobs.json file.
+
+    Cron jobs must be managed exclusively through the ``cronjob`` tool so
+    that file-level locking, validation, and atomicity guarantees hold.
+    Direct writes (from agents, cron sessions, etc.) bypass these safety
+    nets and have caused mass job deletion via TOCTOU races.
+    """
+    import pathlib as _pathlib
+    try:
+        resolved = _pathlib.Path(path).expanduser().resolve()
+        hermes_home = _pathlib.Path("~/.hermes").expanduser().resolve()
+        cron_jobs = hermes_home / "cron" / "jobs.json"
+        return resolved == cron_jobs
+    except (OSError, ValueError):
+        return False
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     """Write content to a file."""
     sensitive_err = _check_sensitive_path(path)
     if sensitive_err:
         return json.dumps({"error": sensitive_err}, ensure_ascii=False)
     try:
+        content = _strip_ansi(content)
+        if _is_protected_cron_path(path):
+            return json.dumps({
+                "error": (
+                    "BLOCKED: ~/.hermes/cron/jobs.json is a protected system file. "
+                    "Direct writes are not allowed because they bypass the file-level "
+                    "locking and validation in the cronjob tool, which has caused "
+                    "data loss via TOCTOU races. Use the cronjob tool to create, "
+                    "update, pause, resume, or remove cron jobs."
+                )
+            }, ensure_ascii=False)
         file_ops = _get_file_ops(task_id)
         result = file_ops.write_file(path, content)
         return json.dumps(result.to_dict(), ensure_ascii=False)
@@ -346,6 +375,21 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         if sensitive_err:
             return json.dumps({"error": sensitive_err}, ensure_ascii=False)
     try:
+        if _is_protected_cron_path(path or ""):
+            return json.dumps({
+                "error": (
+                    "BLOCKED: ~/.hermes/cron/jobs.json is a protected system file. "
+                    "Use the cronjob tool to manage cron jobs."
+                )
+            }, ensure_ascii=False)
+        # Also block patch mode that targets jobs.json via the patch content
+        if mode == "patch" and patch and "jobs.json" in patch:
+            return json.dumps({
+                "error": (
+                    "BLOCKED: Patch targets the protected cron jobs.json file. "
+                    "Use the cronjob tool to manage cron jobs."
+                )
+            }, ensure_ascii=False)
         file_ops = _get_file_ops(task_id)
         
         if mode == "replace":
