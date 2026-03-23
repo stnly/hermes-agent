@@ -80,6 +80,13 @@ from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
 )
+from agent.camel_guard import (
+    CamelDecision,
+    CamelGuard,
+    CamelGuardConfig,
+    normalize_camel_guard_mode,
+    sanitize_message_for_api,
+)
 from agent.model_metadata import (
     fetch_model_metadata,
     estimate_tokens_rough, estimate_messages_tokens_rough, estimate_request_tokens_rough,
