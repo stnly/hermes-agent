@@ -564,6 +564,23 @@ class BasePlatformAdapter(ABC):
         """
         return SendResult(success=False, error="Not supported")
 
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        approval_id: str,
+        on_resolve: "callable" = None,
+        thread_id: str = None,
+    ) -> SendResult:
+        """
+        Send an interactive approval prompt for a dangerous command.
+
+        Override in subclasses that support interactive approval UI (e.g. Discord).
+        The default implementation returns not-supported, causing the gateway to
+        fall through to the text-based approval flow.
+        """
+        return SendResult(success=False, error="Not supported")
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
         Send a typing indicator.

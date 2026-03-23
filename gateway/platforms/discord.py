@@ -1848,7 +1848,8 @@ class DiscordAdapter(BasePlatformAdapter):
             return None
 
     async def send_exec_approval(
-        self, chat_id: str, command: str, approval_id: str
+        self, chat_id: str, command: str, approval_id: str,
+        on_resolve: callable = None, thread_id: str = None
     ) -> SendResult:
         """
         Send a button-based exec approval prompt for a dangerous command.
@@ -1859,9 +1860,10 @@ class DiscordAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            channel = self._client.get_channel(int(chat_id))
+            target_id = thread_id or chat_id
+            channel = self._client.get_channel(int(target_id))
             if not channel:
-                channel = await self._client.fetch_channel(int(chat_id))
+                channel = await self._client.fetch_channel(int(target_id))
 
             # Discord embed description limit is 4096; show full command up to that
             max_desc = 4088
@@ -1876,6 +1878,7 @@ class DiscordAdapter(BasePlatformAdapter):
             view = ExecApprovalView(
                 approval_id=approval_id,
                 allowed_user_ids=self._allowed_user_ids,
+                on_resolve=on_resolve,
             )
 
             msg = await channel.send(embed=embed, view=view)
@@ -2211,11 +2214,13 @@ if DISCORD_AVAILABLE:
         Only users in the allowed list can click. The view times out after 5 minutes.
         """
 
-        def __init__(self, approval_id: str, allowed_user_ids: set):
+        def __init__(self, approval_id: str, allowed_user_ids: set,
+                     on_resolve: callable = None):
             super().__init__(timeout=300)  # 5-minute timeout
             self.approval_id = approval_id
             self.allowed_user_ids = allowed_user_ids
             self.resolved = False
+            self.on_resolve = on_resolve  # callback(action, chat_id, thread_id)
 
         def _check_auth(self, interaction: discord.Interaction) -> bool:
             """Verify the user clicking is authorized."""
@@ -2225,7 +2230,7 @@ if DISCORD_AVAILABLE:
 
         async def _resolve(
             self, interaction: discord.Interaction, action: str, color: discord.Color
-        ):
+        ) -> None:
             """Resolve the approval and update the message."""
             if self.resolved:
                 await interaction.response.send_message(
@@ -2262,6 +2267,15 @@ if DISCORD_AVAILABLE:
                     approve_permanent(self.approval_id)
             except ImportError:
                 pass
+
+            # Notify gateway via callback so it can re-run the command
+            if self.on_resolve:
+                try:
+                    chat_id = str(interaction.channel_id)
+                    thread_id = str(interaction.channel_id) if hasattr(interaction.channel, 'parent_id') and interaction.channel.parent_id else None
+                    await self.on_resolve(action, chat_id, thread_id)
+                except Exception as e:
+                    logger.error("Approval callback failed: %s", e)
 
         @discord.ui.button(label="Allow Once", style=discord.ButtonStyle.green)
         async def allow_once(

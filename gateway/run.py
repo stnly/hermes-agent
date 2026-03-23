@@ -2713,7 +2713,61 @@ class GatewayRunner:
                 if pending:
                     pending["timestamp"] = _time.time()
                     self._pending_approvals[session_key] = pending
-                    # Append structured instructions so the user knows how to respond
+
+                    # Try to send an interactive approval prompt via the platform adapter.
+                    # Discord has button-based approval; other platforms fall through to
+                    # the text-based flow (user replies yes/no).
+                    adapter = self.adapters.get(source.platform)
+                    if adapter and hasattr(adapter, 'send_exec_approval'):
+                        cmd = pending.get("command", "")
+                        pk = pending.get("pattern_key", "")
+                        description = pending.get("description", "command flagged")
+
+                        async def _on_approval_resolve(action, chat_id, thread_id):
+                            """Callback from platform approval UI (e.g. Discord buttons)."""
+                            if action in ("allow_once", "allow_always"):
+                                # Approve in session
+                                from tools.approval import approve_session, approve_permanent
+                                pattern_keys = pending.get("pattern_keys", [pk])
+                                for pattern_key in pattern_keys:
+                                    if not pattern_key:
+                                        continue
+                                    approve_session(session_key, pattern_key)
+                                    if action == "allow_always":
+                                        approve_permanent(pattern_key)
+                                # Remove from pending
+                                self._pending_approvals.pop(session_key, None)
+                                # Re-run the command
+                                from tools.terminal_tool import terminal_tool
+                                result = terminal_tool(command=cmd, force=True)
+                                result_text = result[:3500] if isinstance(result, str) else str(result)
+                                reply_thread = thread_id or chat_id
+                                await adapter.send(
+                                    chat_id=reply_thread,
+                                    content=f"✅ Command approved and executed.\n\n```\n{result_text}\n```",
+                                    metadata={"thread_id": thread_id} if thread_id else None,
+                                )
+                            elif action == "deny":
+                                self._pending_approvals.pop(session_key, None)
+                                reply_thread = thread_id or chat_id
+                                await adapter.send(
+                                    chat_id=reply_thread,
+                                    content="❌ Command denied.",
+                                    metadata={"thread_id": thread_id} if thread_id else None,
+                                )
+
+                        approval_result = await adapter.send_exec_approval(
+                            chat_id=source.chat_id,
+                            command=cmd,
+                            approval_id=pk,
+                            on_resolve=_on_approval_resolve,
+                            thread_id=source.thread_id,
+                        )
+                        if approval_result and approval_result.success:
+                            # Approval UI was sent successfully; suppress the text response
+                            return None
+
+                    # Fallback: append structured instructions so the user knows how to respond
                     cmd_preview = pending.get("command", "")
                     if len(cmd_preview) > 200:
                         cmd_preview = cmd_preview[:200] + "..."
@@ -2725,7 +2779,7 @@ class GatewayRunner:
                     )
                     response = (response or "") + approval_hint
             except Exception as e:
-                logger.debug("Failed to check pending approvals: %s", e)
+                logger.debug("Failed to send interactive approval: %s", e)
             
             # Save the full conversation to the transcript, including tool calls.
             # This preserves the complete agent loop (tool_calls, tool results,
