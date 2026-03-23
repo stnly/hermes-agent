@@ -575,6 +575,16 @@ def tick(verbose: bool = True) -> int:
                 if should_deliver and success and deliver_content.strip().upper().startswith(SILENT_MARKER):
                     logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
                     should_deliver = False
+                # Also skip common no-content signal prefixes
+                if should_deliver and success:
+                    _no_content_prefixes = (
+                        "no new alerts", "no new alert", "no alerts",
+                        "nothing to report", "no news", "no updates",
+                        "no new signals", "no significant", "no actionable",
+                    )
+                    if any(deliver_content.strip().lower().startswith(p) for p in _no_content_prefixes):
+                        logger.info("Job '%s': no-content prefix detected — skipping delivery", job["id"])
+                        should_deliver = False
 
                 if should_deliver:
                     try:
