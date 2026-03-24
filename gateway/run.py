@@ -643,6 +643,9 @@ class GatewayRunner:
             if not history or len(history) < 4:
                 return
 
+            logger.info("Starting pre-reset memory flush for session %s (history: %d msgs)",
+                        old_session_id, len(history))
+
             from run_agent import AIAgent
             runtime_kwargs = _resolve_runtime_agent_kwargs()
             if not runtime_kwargs.get("api_key"):
@@ -656,9 +659,9 @@ class GatewayRunner:
             tmp_agent = AIAgent(
                 **runtime_kwargs,
                 model=model,
-                max_iterations=8,
+                max_iterations=12,
                 quiet_mode=True,
-                enabled_toolsets=["memory", "skills"],
+                enabled_toolsets=["memory", "skills", "file", "terminal"],
                 session_id=old_session_id,
                 honcho_session_key=honcho_session_key,
             )
@@ -696,12 +699,23 @@ class GatewayRunner:
                 "[System: This session is about to be automatically reset due to "
                 "inactivity or a scheduled daily reset. The conversation context "
                 "will be cleared after this turn.\n\n"
-                "Review the conversation above and:\n"
-                "1. Save any important facts, preferences, or decisions to memory "
-                "(user profile or your notes) that would be useful in future sessions.\n"
-                "2. If you discovered a reusable workflow or solved a non-trivial "
-                "problem, consider saving it as a skill.\n"
-                "3. If nothing is worth saving, that's fine — just skip.\n\n"
+                "Review the conversation above and save what matters to QMD. "
+                "Follow the qmd-memory skill protocols (v2.0).\n\n"
+                "1. Read the current state of relevant QMD files first "
+                "(key.md, now.md, log.md for active projects).\n"
+                "2. Extract decisions, preferences, facts, and research findings.\n"
+                "3. Write to appropriate QMD files under "
+                "~/.hermes/qmd-memory/.\n"
+                "4. Update now.md for any active project -- REWRITE it (synthesize "
+                "last 3-5 sessions, not just this one). Read the current now.md "
+                "first so you don't flatten richer context.\n"
+                "5. Prepend signed log entries to project log.md and global "
+                "log.md. Format: --- header with session + date, then ## title, "
+                "then what happened with rationale.\n"
+                "6. If significant research was done (10+ min, multiple sources), "
+                "create a structured research doc in research/.\n"
+                "7. Run `qmd update -c memory` when done.\n"
+                "8. If nothing is worth saving, skip.\n\n"
             )
 
             if _current_memory:
@@ -716,16 +730,44 @@ class GatewayRunner:
                 )
 
             flush_prompt += (
-                "Do NOT respond to the user. Just use the memory and skill_manage "
-                "tools if needed, then stop.]"
+                "Do NOT respond to the user. Just use the memory, skill_manage, "
+                "file, and terminal tools if needed, then stop.]"
             )
 
-            tmp_agent.run_conversation(
+            result = tmp_agent.run_conversation(
                 user_message=flush_prompt,
                 conversation_history=msgs,
                 sync_honcho=False,
             )
-            logger.info("Pre-reset memory flush completed for session %s", old_session_id)
+
+            # Extract tool usage summary from messages
+            tool_names_used = set()
+            for msg in result.get("messages", []):
+                if msg.get("role") == "assistant":
+                    for tc in msg.get("tool_calls") or []:
+                        if isinstance(tc, dict) and tc.get("function", {}).get("name"):
+                            tool_names_used.add(tc["function"]["name"])
+                        elif hasattr(tc, "function") and tc.function.name:
+                            tool_names_used.add(tc.function.name)
+
+            # Get final response (if any) for result summary
+            final_resp = result.get("final_response") or ""
+            resp_preview = final_resp[:200] + "..." if len(final_resp) > 200 else final_resp
+
+            if tool_names_used:
+                logger.info(
+                    "Pre-reset memory flush completed for session %s | tools: %s | response: %s",
+                    old_session_id,
+                    ", ".join(sorted(tool_names_used)),
+                    resp_preview if resp_preview else "(no response)"
+                )
+            else:
+                logger.info(
+                    "Pre-reset memory flush completed for session %s | no tools used | response: %s",
+                    old_session_id,
+                    resp_preview if resp_preview else "(no response)"
+                )
+
             # Flush any queued Honcho writes before the session is dropped
             if getattr(tmp_agent, '_honcho', None):
                 try:
@@ -748,6 +790,32 @@ class GatewayRunner:
             old_session_id,
             honcho_session_key,
         )
+
+    async def _flush_memories_then_hook(
+        self,
+        old_session_id: str,
+        honcho_session_key: Optional[str],
+        source,
+    ):
+        """Flush memories, then emit session:end hook to re-index QMD.
+
+        This ensures qmd update runs AFTER the flush agent writes new files,
+        fixing the race condition where session:end fired before the flush
+        completed (the flush is fire-and-forget via create_task).
+        """
+        try:
+            await self._async_flush_memories(old_session_id, honcho_session_key)
+        except Exception as e:
+            logger.debug("Background memory flush failed: %s", e)
+        # Re-index now that the flush agent has written files
+        try:
+            await self.hooks.emit("session:end", {
+                "platform": source.platform.value if source.platform else "",
+                "user_id": source.user_id,
+                "session_key": honcho_session_key,
+            })
+        except Exception as e:
+            logger.debug("session:end hook after flush failed: %s", e)
 
     @property
     def should_exit_cleanly(self) -> bool:
@@ -2366,6 +2434,15 @@ class GatewayRunner:
                             ]
 
                             if len(_hyg_msgs) >= 4:
+                                # Save lessons to QMD before auto-compress
+                                # destroys detail.
+                                try:
+                                    await self._async_flush_memories(
+                                        session_entry.session_id,
+                                    )
+                                except Exception:
+                                    pass
+
                                 _hyg_agent = AIAgent(
                                     **_hyg_runtime,
                                     model=_hyg_model,
@@ -3087,7 +3164,7 @@ class GatewayRunner:
             old_entry = self.session_store._entries.get(session_key)
             if old_entry:
                 _flush_task = asyncio.create_task(
-                    self._async_flush_memories(old_entry.session_id, session_key)
+                    self._flush_memories_then_hook(old_entry.session_id, session_key, source)
                 )
                 self._background_tasks.add(_flush_task)
                 _flush_task.add_done_callback(self._background_tasks.discard)
@@ -4476,6 +4553,29 @@ class GatewayRunner:
             ]
             original_count = len(msgs)
             approx_tokens = estimate_messages_tokens_rough(msgs)
+
+            # Save lessons to QMD before compression destroys detail.
+            # Uses a separate lightweight agent so it doesn't affect the
+            # compress agent's state or iteration budget.
+            try:
+                await self._async_flush_memories(
+                    session_entry.session_id,
+                )
+            except Exception:
+                pass  # Non-fatal — compression should still proceed
+
+            # Emit command:compress hook so qmd-save re-indexes after flush.
+            # (The generic command:* emit at line ~1665 may be skipped when
+            # the agent is running and /compress is treated as a priority
+            # interrupt, so we fire it again here as a safety net.)
+            try:
+                await self.hooks.emit("command:compress", {
+                    "platform": source.platform.value if source.platform else "",
+                    "user_id": source.user_id,
+                    "command": "compress",
+                })
+            except Exception:
+                pass
 
             tmp_agent = AIAgent(
                 **runtime_kwargs,
@@ -6108,8 +6208,7 @@ class GatewayRunner:
                     first_response = result.get("final_response", "")
                     if first_response and not _already_streamed:
                         try:
-                            await adapter.send(source.chat_id, first_response,
-                                               metadata=getattr(event, "metadata", None))
+                            await adapter.send(source.chat_id, first_response)
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
                 # else: interrupted — discard the interrupted response ("Operation
