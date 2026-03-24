@@ -817,6 +817,66 @@ class GatewayRunner:
         except Exception as e:
             logger.debug("session:end hook after flush failed: %s", e)
 
+    async def _build_compress_state_note(self) -> str:
+        """Build a state-restoration note to append after context compression.
+
+        After compression, the agent loses its working memory. This note
+        re-establishes context by reading the most recent QMD memory files
+        and the persistent memory files.
+        """
+        try:
+            parts = []
+
+            # 1. Read persistent memory files directly from disk (capped at 50 lines)
+            memory_dir = Path.home() / ".hermes" / "memory"
+            for name, label in (("MEMORY.md", "Persistent Memory"), ("USER.md", "User Profile")):
+                p = memory_dir / name
+                if p.exists():
+                    try:
+                        content = p.read_text(encoding="utf-8").strip()
+                        if content:
+                            lines = content.split("\n")[:50]
+                            snippet = "\n".join(lines)
+                            if len(content) > len(snippet):
+                                snippet += "\n..."
+                            parts.append(f"## {label}\n{snippet}")
+                    except Exception:
+                        pass
+
+            # 2. Read most recently modified QMD memory files (key.md, now.md) — skip logs, they're too long
+            qmd_dir = Path.home() / ".hermes" / "qmd-memory"
+            if qmd_dir.exists():
+                qmd_snippets = []
+                # Find all key.md and now.md files recursively
+                for f in qmd_dir.rglob("**/key.md"):
+                    if f.exists():
+                        try:
+                            content = f.read_text(encoding="utf-8").strip()
+                            if content:
+                                # Cap at 30 lines per file
+                                lines = content.split("\n")[:30]
+                                snippet = "\n".join(lines)
+                                if len(content) > len(snippet):
+                                    snippet += "\n..."
+                                qmd_snippets.append(f"### {f.relative_path()}\n{snippet}")
+                        except Exception:
+                            continue
+                if qmd_snippets:
+                    parts.append("## QMD Memory\n" + "\n\n".join(qmd_snippets))
+
+            if not parts:
+                return ""
+
+            return (
+                "[CONTEXT RESTORED AFTER COMPRESSION]\n"
+                "The conversation was just compressed. Here is your current state "
+                "so you don't lose your bearings:\n\n"
+                + "\n\n".join(parts)
+            )
+        except Exception as e:
+            logger.debug("Failed to build compress state note: %s", e)
+            return ""
+
     @property
     def should_exit_cleanly(self) -> bool:
         return self._exit_cleanly
@@ -4601,6 +4661,16 @@ class GatewayRunner:
             if new_session_id != session_entry.session_id:
                 session_entry.session_id = new_session_id
                 self.session_store._save()
+
+            # Re-inject current state after compression so the agent retains
+            # its bearings. Without this, context compression destroys the
+            # agent's working memory of what it was doing.
+            state_note = await self._build_compress_state_note()
+            if state_note:
+                compressed.append({
+                    "role": "user",
+                    "content": state_note,
+                })
 
             self.session_store.rewrite_transcript(new_session_id, compressed)
             # Reset stored token count — transcript changed, old value is stale
