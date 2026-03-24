@@ -843,22 +843,50 @@ class GatewayRunner:
                     except Exception:
                         pass
 
-            # 2. Read most recently modified QMD memory files (key.md, now.md) — skip logs, they're too long
+            # 2. Read user preferences from QMD (user profile, services, environment)
             qmd_dir = Path.home() / ".hermes" / "qmd-memory"
             if qmd_dir.exists():
-                qmd_snippets = []
-                # Find all key.md and now.md files recursively
-                for f in qmd_dir.rglob("**/key.md"):
-                    if f.exists():
+                pref_dir = qmd_dir / "preferences"
+                if pref_dir.exists():
+                    pref_snippets = []
+                    for f in sorted(pref_dir.glob("*.md")):
                         try:
                             content = f.read_text(encoding="utf-8").strip()
                             if content:
-                                # Cap at 30 lines per file
                                 lines = content.split("\n")[:30]
                                 snippet = "\n".join(lines)
                                 if len(content) > len(snippet):
                                     snippet += "\n..."
-                                qmd_snippets.append(f"### {f.relative_path()}\n{snippet}")
+                                pref_snippets.append(f"### {f.name}\n{snippet}")
+                        except Exception:
+                            continue
+                    if pref_snippets:
+                        parts.append("## User Preferences\n" + "\n\n".join(pref_snippets))
+
+                # 3. Read most recently modified QMD project files (key.md, now.md)
+                # Group by project directory, sort projects by most recent mtime,
+                # and read both files from each project together.
+                project_map: dict[Path, list[Path]] = {}
+                for f in qmd_dir.rglob("*"):
+                    if f.is_file() and f.name in ("key.md", "now.md"):
+                        project_map.setdefault(f.parent, []).append(f)
+                # Sort projects by most recently modified file, cap at 3
+                qmd_snippets = []
+                for project_dir, files in sorted(
+                    project_map.items(),
+                    key=lambda item: max(f.stat().st_mtime for f in item[1]),
+                    reverse=True,
+                )[:3]:
+                    for f in files:
+                        try:
+                            content = f.read_text(encoding="utf-8").strip()
+                            if content:
+                                lines = content.split("\n")[:30]
+                                snippet = "\n".join(lines)
+                                if len(content) > len(snippet):
+                                    snippet += "\n..."
+                                rel = f.relative_to(qmd_dir)
+                                qmd_snippets.append(f"### {rel}\n{snippet}")
                         except Exception:
                             continue
                 if qmd_snippets:
@@ -868,14 +896,28 @@ class GatewayRunner:
                 return ""
 
             return (
-                "[CONTEXT RESTORED AFTER COMPRESSION]\n"
-                "The conversation was just compressed. Here is your current state "
-                "so you don't lose your bearings:\n\n"
+                "[CONTEXT RESTORED]\n"
+                "Here is your current state so you don't lose your bearings:\n\n"
                 + "\n\n".join(parts)
             )
         except Exception as e:
             logger.debug("Failed to build compress state note: %s", e)
             return ""
+
+    def _build_compress_state_note_sync(self) -> str:
+        """Sync wrapper for _build_compress_state_note (for use in sync contexts)."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop and loop.is_running():
+            # Event loop already running — extract the sync I/O into a coroutine
+            # and run it in a separate thread via run_in_executor.
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, self._build_compress_state_note())
+                return future.result(timeout=10)
+        return asyncio.run(self._build_compress_state_note())
 
     @property
     def should_exit_cleanly(self) -> bool:
@@ -2768,6 +2810,7 @@ class GatewayRunner:
                 session_id=session_entry.session_id,
                 session_key=session_key,
                 event_message_id=event.message_id,
+                is_new_session=_is_new_session,
             )
 
             # Stop persistent typing indicator now that the agent is done
@@ -5560,6 +5603,7 @@ class GatewayRunner:
         session_key: str = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
+        is_new_session: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -5807,6 +5851,9 @@ class GatewayRunner:
             # processes can be mapped back to this gateway session
             os.environ["HERMES_SESSION_KEY"] = session_key or ""
 
+            # Capture async-scope variables for use inside the sync run_sync closure
+            _is_new_session_local = is_new_session
+
             # Read from env var or use default (same as CLI)
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
             
@@ -6013,6 +6060,23 @@ class GatewayRunner:
             # from the current turn's extraction. This is compression-safe:
             # even if the message list shrinks, we know which paths are old.
             _history_media_paths: set = set()
+
+            # On a fresh session (after reset or expiry, or empty history),
+            # inject a QMD state note so the agent has immediate context about
+            # the user and active projects.
+            if _is_new_session_local or not agent_history:
+                try:
+                    state_note = self._build_compress_state_note_sync()
+                    if state_note:
+                        agent_history.append({
+                            "role": "user",
+                            "content": state_note,
+                        })
+                        logger.info("Injected QMD state note for new session %s (%d chars)", session_id, len(state_note))
+                    else:
+                        logger.info("New session %s but no QMD state note to inject", session_id)
+                except Exception as e:
+                    logger.debug("Failed to inject QMD state note: %s", e)
             for _hm in agent_history:
                 if _hm.get("role") in ("tool", "function"):
                     _hc = _hm.get("content", "")
