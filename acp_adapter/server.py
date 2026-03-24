@@ -398,8 +398,8 @@ class HermesACPAgent(acp.Agent):
         # Auto-detect provider for the requested model
         try:
             from hermes_cli.models import parse_model_input, detect_provider_for_model
-            target_provider, new_model = parse_model_input(new_model, current_provider)
-            if target_provider == current_provider:
+            target_provider, new_model, _explicit = parse_model_input(new_model, current_provider)
+            if not _explicit and target_provider == current_provider:
                 detected = detect_provider_for_model(new_model, current_provider)
                 if detected:
                     target_provider, new_model = detected

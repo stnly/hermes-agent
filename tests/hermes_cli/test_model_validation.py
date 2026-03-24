@@ -47,75 +47,95 @@ def _validate(model, provider="openrouter", api_models=FAKE_API_MODELS, **kw):
 
 class TestParseModelInput:
     def test_plain_model_keeps_current_provider(self):
-        provider, model = parse_model_input("anthropic/claude-sonnet-4.5", "openrouter")
+        provider, model, explicit = parse_model_input("anthropic/claude-sonnet-4.5", "openrouter")
         assert provider == "openrouter"
         assert model == "anthropic/claude-sonnet-4.5"
+        assert explicit is False
 
     def test_provider_colon_model_switches_provider(self):
-        provider, model = parse_model_input("openrouter:anthropic/claude-sonnet-4.5", "nous")
+        provider, model, explicit = parse_model_input("openrouter:anthropic/claude-sonnet-4.5", "nous")
         assert provider == "openrouter"
         assert model == "anthropic/claude-sonnet-4.5"
+        assert explicit is True
 
     def test_provider_alias_resolved(self):
-        provider, model = parse_model_input("glm:glm-5", "openrouter")
+        provider, model, explicit = parse_model_input("glm:glm-5", "openrouter")
         assert provider == "zai"
         assert model == "glm-5"
+        assert explicit is True
 
     def test_no_slash_no_colon_keeps_provider(self):
-        provider, model = parse_model_input("gpt-5.4", "openrouter")
+        provider, model, explicit = parse_model_input("gpt-5.4", "openrouter")
         assert provider == "openrouter"
         assert model == "gpt-5.4"
+        assert explicit is False
 
     def test_nous_provider_switch(self):
-        provider, model = parse_model_input("nous:hermes-3", "openrouter")
+        provider, model, explicit = parse_model_input("nous:hermes-3", "openrouter")
         assert provider == "nous"
         assert model == "hermes-3"
+        assert explicit is True
 
     def test_empty_model_after_colon_keeps_current(self):
-        provider, model = parse_model_input("openrouter:", "nous")
+        provider, model, explicit = parse_model_input("openrouter:", "nous")
         assert provider == "nous"
         assert model == "openrouter:"
+        assert explicit is False
 
     def test_colon_at_start_keeps_current(self):
-        provider, model = parse_model_input(":something", "openrouter")
+        provider, model, explicit = parse_model_input(":something", "openrouter")
         assert provider == "openrouter"
         assert model == ":something"
+        assert explicit is False
 
     def test_unknown_prefix_colon_not_treated_as_provider(self):
         """Colons are only provider delimiters if the left side is a known provider."""
-        provider, model = parse_model_input("anthropic/claude-3.5-sonnet:beta", "openrouter")
+        provider, model, explicit = parse_model_input("anthropic/claude-3.5-sonnet:beta", "openrouter")
         assert provider == "openrouter"
         assert model == "anthropic/claude-3.5-sonnet:beta"
+        assert explicit is False
 
     def test_http_url_not_treated_as_provider(self):
-        provider, model = parse_model_input("http://localhost:8080/model", "openrouter")
+        provider, model, explicit = parse_model_input("http://localhost:8080/model", "openrouter")
         assert provider == "openrouter"
         assert model == "http://localhost:8080/model"
+        assert explicit is False
+
+    def test_explicit_provider_same_as_current(self):
+        """Typing provider:model where provider matches current still sets explicit=True."""
+        provider, model, explicit = parse_model_input("zai:glm-5-turbo", "zai")
+        assert provider == "zai"
+        assert model == "glm-5-turbo"
+        assert explicit is True
 
     def test_custom_colon_model_single(self):
         """custom:model-name → anonymous custom provider."""
-        provider, model = parse_model_input("custom:qwen-2.5", "openrouter")
+        provider, model, explicit = parse_model_input("custom:qwen-2.5", "openrouter")
         assert provider == "custom"
         assert model == "qwen-2.5"
+        assert explicit is True
 
     def test_custom_triple_syntax(self):
         """custom:name:model → named custom provider."""
-        provider, model = parse_model_input("custom:local-server:qwen-2.5", "openrouter")
+        provider, model, explicit = parse_model_input("custom:local-server:qwen-2.5", "openrouter")
         assert provider == "custom:local-server"
         assert model == "qwen-2.5"
+        assert explicit is True
 
     def test_custom_triple_spaces(self):
         """Triple syntax should handle whitespace."""
-        provider, model = parse_model_input("custom: my-server : my-model ", "openrouter")
+        provider, model, explicit = parse_model_input("custom: my-server : my-model ", "openrouter")
         assert provider == "custom:my-server"
         assert model == "my-model"
+        assert explicit is True
 
     def test_custom_triple_empty_model_falls_back(self):
         """custom:name: with no model → treated as custom:name (bare)."""
-        provider, model = parse_model_input("custom:name:", "openrouter")
+        provider, model, explicit = parse_model_input("custom:name:", "openrouter")
         # Empty model after second colon → no triple match, falls through
         assert provider == "custom"
         assert model == "name:"
+        assert explicit is True
 
 
 # -- curated_models_for_provider ---------------------------------------------

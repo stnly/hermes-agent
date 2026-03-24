@@ -3100,12 +3100,9 @@ class GatewayRunner:
         # Reset the session
         new_entry = self.session_store.reset_session(session_key)
 
-        # Emit session:end hook (session is ending)
-        await self.hooks.emit("session:end", {
-            "platform": source.platform.value if source.platform else "",
-            "user_id": source.user_id,
-            "session_key": session_key,
-        })
+        # Emit session:end hook after flush completes (handled by _flush_memories_then_hook).
+        # We don't emit it here because the flush agent hasn't written QMD files yet,
+        # and the hook's job (qmd update) would re-index stale data.
 
         # Emit session:reset hook
         await self.hooks.emit("session:reset", {

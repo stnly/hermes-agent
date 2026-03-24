@@ -367,7 +367,7 @@ def list_available_providers() -> list[dict[str, str]]:
     return result
 
 
-def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
+def parse_model_input(raw: str, current_provider: str) -> tuple[str, str, bool]:
     """Parse ``/model`` input into ``(provider, model)``.
 
     Supports ``provider:model`` syntax to switch providers at runtime::
@@ -381,8 +381,10 @@ def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
     recognized provider name or alias.  This avoids misinterpreting model names
     that happen to contain colons (e.g. ``anthropic/claude-3.5-sonnet:beta``).
 
-    Returns ``(provider, model)`` where *provider* is either the explicit
-    provider from the input or *current_provider* if none was specified.
+    Returns ``(provider, model, explicit_provider)`` where *provider* is
+    either the explicit provider from the input or *current_provider* if
+    none was specified, and *explicit_provider* is ``True`` when the user
+    typed a recognized ``provider:model`` prefix.
     """
     stripped = raw.strip()
     colon = stripped.find(":")
@@ -398,9 +400,9 @@ def parse_model_input(raw: str, current_provider: str) -> tuple[str, str]:
                 custom_name = model_part[:second_colon].strip()
                 actual_model = model_part[second_colon + 1:].strip()
                 if custom_name and actual_model:
-                    return (f"custom:{custom_name}", actual_model)
-            return (normalize_provider(provider_part), model_part)
-    return (current_provider, stripped)
+                    return (f"custom:{custom_name}", actual_model, True)
+            return (normalize_provider(provider_part), model_part, True)
+    return (current_provider, stripped, False)
 
 
 def _get_custom_base_url() -> str:
