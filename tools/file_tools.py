@@ -336,7 +336,6 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     if sensitive_err:
         return json.dumps({"error": sensitive_err}, ensure_ascii=False)
     try:
-        content = _strip_ansi(content)
         if _is_protected_cron_path(path):
             return json.dumps({
                 "error": (
