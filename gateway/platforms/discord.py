@@ -1473,11 +1473,177 @@ class DiscordAdapter(BasePlatformAdapter):
     def format_message(self, content: str) -> str:
         """
         Format message for Discord.
-        
-        Discord uses its own markdown variant.
+
+        Discord uses its own markdown variant.  Pipe-delimited markdown
+        tables are converted to fixed-width code-block tables because
+        Discord does not render markdown tables natively.
         """
-        # Discord markdown is fairly standard, no special escaping needed
-        return content
+        return self._convert_markdown_tables(content)
+
+    @staticmethod
+    def _convert_markdown_tables(content: str) -> str:
+        """Replace pipe-delimited markdown tables with code-block tables.
+
+        Scans *content* for consecutive lines that look like a markdown table
+        (lines starting with ``|``) and converts each one into a fixed-width
+        ````text```` code block with box-drawing borders.  Inline markdown
+        formatting (``**bold**``, ``*italic*``, `` `code` ``) inside cells is
+        stripped since code blocks don't render markdown.
+
+        Tables that are already inside code blocks are left untouched.
+        """
+        import re
+
+        _STRIP_MD = re.compile(r"(\*\*|__)(.+?)\1|(\*|_)(.+?)\3|`(.+?)`")
+
+        def strip_markdown(text: str) -> str:
+            """Remove bold/italic/code markers, keep the inner text."""
+            return _STRIP_MD.sub(lambda m: m.group(2) or m.group(4) or m.group(5), text)
+
+        lines = content.split("\n")
+        result: list[str] = []
+        i = 0
+        in_code_block = False
+
+        while i < len(lines):
+            # Track code block boundaries so we don't mangle existing tables
+            stripped = lines[i].strip()
+            if stripped.startswith("```"):
+                in_code_block = not in_code_block
+                result.append(lines[i])
+                i += 1
+                continue
+
+            # Skip lines inside existing code blocks
+            if in_code_block:
+                result.append(lines[i])
+                i += 1
+                continue
+
+            # Check if this line starts a table: must begin with |
+            if stripped.startswith("|"):
+                # Collect all consecutive table lines
+                table_lines: list[str] = []
+                while i < len(lines) and lines[i].strip().startswith("|"):
+                    table_lines.append(lines[i].strip())
+                    i += 1
+
+                # Need at least a header row and a separator to be a real table
+                if len(table_lines) < 2:
+                    result.extend(table_lines)
+                    continue
+
+                # Validate: second line should be a separator (|---|---|)
+                sep_cells = [c.strip() for c in table_lines[1].strip("|").split("|")]
+                if not all(re.match(r"^[-:]+$", c) for c in sep_cells):
+                    # Not a valid table, emit as-is
+                    result.extend(table_lines)
+                    continue
+
+                # Parse rows, skipping separator rows
+                rows: list[list[str]] = []
+                for idx, tl in enumerate(table_lines):
+                    if idx == 1:
+                        continue  # skip the separator
+                    cells = [strip_markdown(c.strip()) for c in tl.strip("|").split("|")]
+                    rows.append(cells)
+
+                if not rows:
+                    continue
+
+                num_cols = max(len(r) for r in rows)
+
+                # Pad rows to equal length
+                for r in rows:
+                    while len(r) < num_cols:
+                        r.append("")
+
+                # Compute column widths from all rows (header + data)
+                col_widths = [0] * num_cols
+                for r in rows:
+                    for j, cell in enumerate(r):
+                        col_widths[j] = max(col_widths[j], len(cell))
+
+                # Target max width.  Borders eat 3 chars per col (| + sp + sp|)
+                # plus 1 for the trailing |.  Budget the rest for content.
+                MAX_WIDTH = 70
+                border_overhead = 1 + num_cols * 3
+                max_content = MAX_WIDTH - border_overhead
+
+                if sum(col_widths) > max_content and max_content > 0:
+                    # Scale down proportionally, minimum 4 chars per column
+                    scale = max_content / sum(col_widths)
+                    col_widths = [max(4, int(w * scale)) for w in col_widths]
+
+                def _wrap_cell(text: str, width: int) -> list[str]:
+                    """Word-wrap a cell into multiple lines."""
+                    if len(text) <= width:
+                        return [text]
+                    words = text.split()
+                    lines: list[str] = []
+                    current = ""
+                    for word in words:
+                        candidate = f"{current} {word}".strip() if current else word
+                        if len(candidate) <= width:
+                            current = candidate
+                        else:
+                            if current:
+                                lines.append(current)
+                            # If a single word exceeds width, hard-break it
+                            if len(word) <= width:
+                                current = word
+                            else:
+                                while word:
+                                    lines.append(word[:width])
+                                    word = word[width:]
+                                current = ""
+                    if current:
+                        lines.append(current)
+                    return lines if lines else [""]
+
+                def _make_border(left: str, mid: str, right: str, fill: str) -> str:
+                    return left + mid.join(fill * (w + 2) for w in col_widths) + right
+
+                def _format_line(cells: list[str]) -> str:
+                    parts: list[str] = []
+                    for j, (cell, w) in enumerate(zip(cells, col_widths)):
+                        parts.append(cell.ljust(w))
+                    return "│ " + " │ ".join(parts) + " │"
+
+                # Wrap every cell into lines, track max depth per row
+                wrapped_rows: list[list[list[str]]] = []
+                for row in rows:
+                    wrapped_rows.append([_wrap_cell(cell, w) for cell, w in zip(row, col_widths)])
+
+                # Build the table line by line
+                top = _make_border("┌", "┬", "┐", "─")
+                divider = _make_border("├", "┼", "┤", "─")
+                bottom = _make_border("└", "┴", "┘", "─")
+
+                table_out: list[str] = [top]
+                for row_idx, wrapped in enumerate(wrapped_rows):
+                    max_lines = max(len(cell_lines) for cell_lines in wrapped)
+                    for line_idx in range(max_lines):
+                        line_cells: list[str] = []
+                        for cell_lines in wrapped:
+                            if line_idx < len(cell_lines):
+                                line_cells.append(cell_lines[line_idx])
+                            else:
+                                line_cells.append("")
+                        table_out.append(_format_line(line_cells))
+                    if row_idx < len(wrapped_rows) - 1:
+                        table_out.append(divider)
+
+                # Wrap in a code block
+                result.append("```")
+                result.extend(table_out)
+                result.append(bottom)
+                result.append("```")
+            else:
+                result.append(lines[i])
+                i += 1
+
+        return "\n".join(result)
 
     async def _run_simple_slash(
         self,

@@ -1499,7 +1499,7 @@ class BasePlatformAdapter(ABC):
                         split_at = safe_split
 
             chunk_body = remaining[:split_at]
-            remaining = remaining[split_at:].lstrip()
+            remaining = remaining[split_at:]
 
             full_chunk = prefix + chunk_body
 
@@ -1522,8 +1522,12 @@ class BasePlatformAdapter(ABC):
                 # Close the orphaned fence so the chunk is valid on its own
                 full_chunk += FENCE_CLOSE
                 carry_lang = lang
+                # Inside a code block, strip only the trailing newline
+                # (not leading whitespace) so table alignment is preserved
+                remaining = remaining.lstrip("\n")
             else:
                 carry_lang = None
+                remaining = remaining.lstrip()
 
             chunks.append(full_chunk)
 
