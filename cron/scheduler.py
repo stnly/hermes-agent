@@ -183,6 +183,12 @@ def _deliver_result(job: dict, content: str) -> None:
         logger.warning("Job '%s': platform '%s' not configured/enabled", job["id"], platform_name)
         return
 
+    # Strip SILENT_RUN marker (agents may append it anywhere)
+    content = content.strip()
+    content = content.replace("SILENT_RUN", "").strip()
+    if not content:
+        return
+
     # Optionally wrap the content with a header/footer so the user knows this
     # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
     # in config.yaml for clean output.
