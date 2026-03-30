@@ -7903,6 +7903,61 @@ class AIAgent:
 
                     self._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                    # If any tool returned approval_required, pause the loop
+                    # and wait for the user to approve, deny, or let it expire.
+                    # The gateway sends the approval prompt asynchronously while
+                    # we block here on a threading.Event.
+                    _new_msgs = messages[_msg_count_before_tools:]
+                    _approval_msgs = [
+                        m for m in _new_msgs
+                        if m.get("role") == "tool"
+                        and '"approval_required"' in (m.get("content") or "")
+                    ]
+                    if _approval_msgs:
+                        import os as _os
+                        _session_key = _os.getenv("HERMES_SESSION_KEY", "default")
+                        self._vprint(
+                            f"{self.log_prefix}⏸️  Tool requires user approval — pausing agent loop",
+                            force=True,
+                        )
+                        from tools.approval import wait_for_approval
+                        _approval_result = wait_for_approval(_session_key)
+
+                        if _approval_result == "approved":
+                            self._vprint(
+                                f"{self.log_prefix}✅ Approval granted — re-executing tool",
+                                force=True,
+                            )
+                            # Replace the approval_required tool results with
+                            # a hint telling the model to retry the same command.
+                            # The session-level approval has been recorded, so
+                            # the next terminal call will pass through.
+                            for _am in _approval_msgs:
+                                _tc_id = _am.get("tool_call_id")
+                                _am["content"] = (
+                                    "Command was approved by the user. "
+                                    "Please retry the exact same command now — "
+                                    "it will execute without asking for approval."
+                                )
+                            # Continue the loop so the LLM retries.
+                        else:
+                            # Denied or expired — stop the loop.
+                            self._vprint(
+                                f"{self.log_prefix}❌ Approval {_approval_result} — stopping agent loop",
+                                force=True,
+                            )
+                            # Replace tool results with a denial message so
+                            # the conversation history is coherent.
+                            for _am in _approval_msgs:
+                                _am["content"] = (
+                                    f"Command was {_approval_result}. "
+                                    "Do NOT retry this command."
+                                )
+                            final_response = assistant_message.content or (
+                                f"Command was {_approval_result} by the user."
+                            )
+                            break
+
                     # Signal that a paragraph break is needed before the next
                     # streamed text.  We don't emit it immediately because
                     # multiple consecutive tool iterations would stack up

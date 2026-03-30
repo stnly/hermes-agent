@@ -2885,122 +2885,10 @@ class GatewayRunner:
             except Exception as e:
                 logger.error("Process watcher setup error: %s", e)
 
-            # Check if the agent encountered a dangerous command needing approval
-            try:
-                from tools.approval import pop_pending
-                import asyncio as _asyncio
-                import time as _time
-                import uuid as _uuid
-                pending = pop_pending(session_key)
-                if pending:
-                    pending["timestamp"] = _time.time()
-                    # Use a unique approval ID instead of session_key so multiple
-                    # sessions can have pending approvals simultaneously.
-                    approval_uid = f"{session_key}:{_uuid.uuid4().hex[:8]}"
-                    self._pending_approvals[approval_uid] = pending
-
-                    # Route approval to the platform's home channel, not the
-                    # originating channel. This keeps approvals centralized and
-                    # does not block the originating session.
-                    adapter = self.adapters.get(source.platform)
-                    if adapter and hasattr(adapter, "send_exec_approval"):
-                        cmd = pending.get("command", "")
-                        pk = pending.get("pattern_key", "")
-                        home_channel = None
-                        try:
-                            home_channel = self.config.get_home_channel(source.platform)
-                        except Exception:
-                            pass
-                        approval_target = home_channel.chat_id if home_channel else source.chat_id
-
-                        # Store source info so the callback can reply to the right channel
-                        _origin_chat_id = source.chat_id
-                        _origin_thread_id = source.thread_id
-                        # Capture only immutable values to avoid stale references
-                        _runner = self
-                        _uid = approval_uid
-                        _sk = session_key
-
-                        async def _on_approval_resolve(action, chat_id, thread_id):
-                            """Callback from platform approval UI (e.g. Discord buttons)."""
-                            # Verify the approval still exists (guard against
-                            # stale callbacks after gateway restart).
-                            if _uid not in _runner._pending_approvals:
-                                logger.warning("Stale approval callback for %s — ignoring", _uid)
-                                return
-                            if action in ("allow_once", "allow_always"):
-                                from tools.approval import approve_session, approve_permanent
-                                pattern_keys = pending.get("pattern_keys", [pk])
-                                for pattern_key in pattern_keys:
-                                    if not pattern_key:
-                                        continue
-                                    approve_session(_sk, pattern_key)
-                                    if action == "allow_always":
-                                        approve_permanent(pattern_key)
-                                # Remove from pending
-                                _runner._pending_approvals.pop(_uid, None)
-                                # Re-run the command in a thread to avoid blocking the event loop
-                                from tools.terminal_tool import terminal_tool
-                                result = await _asyncio.to_thread(
-                                    terminal_tool, command=cmd, force=True
-                                )
-                                result_text = result[:3500] if isinstance(result, str) else str(result)
-                                # Send result back to the originating channel
-                                reply_target = _origin_thread_id or _origin_chat_id
-                                await adapter.send(
-                                    chat_id=reply_target,
-                                    content=f"✅ Command approved and executed.\n\n```\n{result_text}\n```",
-                                    metadata={"thread_id": _origin_thread_id} if _origin_thread_id else None,
-                                )
-                                # Also send result to home channel if different from origin
-                                if approval_target != reply_target:
-                                    await adapter.send(
-                                        chat_id=approval_target,
-                                        content=f"✅ Command approved and executed.\n\n```\n{result_text}\n```",
-                                    )
-                            elif action == "deny":
-                                _runner._pending_approvals.pop(_uid, None)
-                                reply_target = _origin_thread_id or _origin_chat_id
-                                await adapter.send(
-                                    chat_id=reply_target,
-                                    content="❌ Command denied.",
-                                    metadata={"thread_id": _origin_thread_id} if _origin_thread_id else None,
-                                )
-                                # Also send denial to home channel if different from origin
-                                if approval_target != reply_target:
-                                    await adapter.send(
-                                        chat_id=approval_target,
-                                        content="❌ Command denied.",
-                                    )
-
-                        approval_result = await adapter.send_exec_approval(
-                            chat_id=approval_target,
-                            command=cmd,
-                            approval_id=approval_uid,
-                            on_resolve=_on_approval_resolve,
-                            source_info=f"Session: {session_key[:40]}",
-                        )
-                        if approval_result and approval_result.success:
-                            # Append a brief note to the response so the user knows
-                            # an approval was sent. Don't suppress the response.
-                            approval_note = (
-                                f"\n\n⏳ Dangerous command sent for approval to <#{approval_target}>."
-                            )
-                            response = (response or "") + approval_note
-
-                    # Fallback: append structured instructions so the user knows how to respond
-                    cmd_preview = pending.get("command", "")
-                    if len(cmd_preview) > 200:
-                        cmd_preview = cmd_preview[:200] + "..."
-                    approval_hint = (
-                        f"\n\n⚠️ **Dangerous command requires approval:**\n"
-                        f"```\n{cmd_preview}\n```\n"
-                        f"Reply `/approve` to execute, `/approve session` to approve this pattern "
-                        f"for the session, or `/deny` to cancel."
-                    )
-                    response = (response or "") + approval_hint
-            except Exception as e:
-                logger.debug("Failed to send interactive approval: %s", e)
+            # Approval dispatch is now handled by the concurrent approval monitor
+            # inside _run_agent, which polls for pending approvals while the
+            # agent thread is running (and potentially blocked on wait_for_approval).
+            # The /approve and /deny slash commands resolve approvals directly.
             
             # Save the full conversation to the transcript, including tool calls.
             # This preserves the complete agent loop (tool_calls, tool results,
@@ -5039,6 +4927,8 @@ class GatewayRunner:
         ts = approval.get("timestamp", 0)
         if _time.time() - ts > self._APPROVAL_TIMEOUT_SECONDS:
             self._pending_approvals.pop(session_key, None)
+            from tools.approval import resolve_approval
+            resolve_approval(session_key, "expired")
             return "⚠️ Approval expired (timed out after 5 minutes). Ask the agent to try again."
 
         self._pending_approvals.pop(session_key)
@@ -5050,7 +4940,7 @@ class GatewayRunner:
 
         # Determine approval scope from args
         args = event.get_command_args().strip().lower()
-        from tools.approval import approve_session, approve_permanent
+        from tools.approval import approve_session, approve_permanent, resolve_approval
 
         if args in ("always", "permanent", "permanently"):
             for pk in pattern_keys:
@@ -5062,15 +4952,17 @@ class GatewayRunner:
             scope_msg = " (pattern approved for this session)"
         else:
             # One-time approval — just approve for session so the immediate
-            # replay works, but don't advertise it as session-wide
+            # retry works, but don't advertise it as session-wide
             for pk in pattern_keys:
                 approve_session(session_key, pk)
             scope_msg = ""
 
         logger.info("User approved dangerous command via /approve: %s...%s", cmd[:60], scope_msg)
-        from tools.terminal_tool import terminal_tool
-        result = terminal_tool(command=cmd, force=True)
-        return f"✅ Command approved and executed{scope_msg}.\n\n```\n{result[:3500]}\n```"
+
+        # Signal the blocked agent thread to continue. The agent will
+        # retry the command on its own now that session approval is recorded.
+        resolve_approval(session_key, "approved")
+        return f"✅ Command approved{scope_msg} — agent continuing."
 
     async def _handle_deny_command(self, event: MessageEvent) -> str:
         """Handle /deny command — reject a pending dangerous command."""
@@ -5081,6 +4973,8 @@ class GatewayRunner:
             return "No pending command to deny."
 
         self._pending_approvals.pop(session_key)
+        from tools.approval import resolve_approval
+        resolve_approval(session_key, "denied")
         logger.info("User denied dangerous command via /deny")
         return "❌ Command denied."
 
@@ -6263,7 +6157,139 @@ class GatewayRunner:
                         break
         
         interrupt_monitor = asyncio.create_task(monitor_for_interrupt())
-        
+
+        # Monitor for pending dangerous-command approvals while the agent runs.
+        # The agent blocks on wait_for_approval() in the sync thread; this
+        # async task polls for the pending approval, sends the prompt to the
+        # user, and signals the agent to continue (or stop) when resolved.
+        async def monitor_for_approvals():
+            """Poll for pending approvals and dispatch approval prompts."""
+            import time as _time
+            import uuid as _uuid
+            from tools.approval import pop_pending
+
+            if not session_key:
+                return
+
+            while True:
+                await asyncio.sleep(0.2)  # Check every 200ms
+                pending = pop_pending(session_key)
+                if pending:
+                    break
+            else:
+                return  # Shouldn't happen, but safety
+
+            pending["timestamp"] = _time.time()
+            approval_uid = f"{session_key}:{_uuid.uuid4().hex[:8]}"
+            self._pending_approvals[approval_uid] = pending
+
+            adapter = self.adapters.get(source.platform)
+            interactive_approval_sent = False
+            if adapter and hasattr(adapter, "send_exec_approval"):
+                cmd = pending.get("command", "")
+                pk = pending.get("pattern_key", "")
+                home_channel = None
+                try:
+                    home_channel = self.config.get_home_channel(source.platform)
+                except Exception:
+                    pass
+                approval_target = home_channel.chat_id if home_channel else source.chat_id
+
+                # Store source info for the callback
+                _origin_chat_id = source.chat_id
+                _origin_thread_id = source.thread_id
+                _runner = self
+                _uid = approval_uid
+                _sk = session_key
+
+                async def _on_approval_resolve(action, chat_id, thread_id):
+                    """Callback from platform approval UI (e.g. Discord buttons)."""
+                    if _uid not in _runner._pending_approvals:
+                        logger.warning("Stale approval callback for %s — ignoring", _uid)
+                        return
+                    if action in ("allow_once", "allow_always"):
+                        from tools.approval import approve_session, approve_permanent, resolve_approval
+                        pattern_keys = pending.get("pattern_keys", [pk])
+                        for pattern_key in pattern_keys:
+                            if not pattern_key:
+                                continue
+                            approve_session(_sk, pattern_key)
+                            if action == "allow_always":
+                                approve_permanent(pattern_key)
+                        _runner._pending_approvals.pop(_uid, None)
+                        resolve_approval(_sk, "approved")
+                        reply_target = _origin_thread_id or _origin_chat_id
+                        await adapter.send(
+                            chat_id=reply_target,
+                            content="✅ Command approved — agent continuing.",
+                            metadata={"thread_id": _origin_thread_id} if _origin_thread_id else None,
+                        )
+                        if approval_target != reply_target:
+                            await adapter.send(
+                                chat_id=approval_target,
+                                content="✅ Command approved — agent continuing.",
+                            )
+                    elif action == "deny":
+                        from tools.approval import resolve_approval
+                        _runner._pending_approvals.pop(_uid, None)
+                        resolve_approval(_sk, "denied")
+                        reply_target = _origin_thread_id or _origin_chat_id
+                        await adapter.send(
+                            chat_id=reply_target,
+                            content="❌ Command denied.",
+                            metadata={"thread_id": _origin_thread_id} if _origin_thread_id else None,
+                        )
+                        if approval_target != reply_target:
+                            await adapter.send(
+                                chat_id=approval_target,
+                                content="❌ Command denied.",
+                            )
+
+                try:
+                    approval_result = await adapter.send_exec_approval(
+                        chat_id=approval_target,
+                        command=cmd,
+                        approval_id=approval_uid,
+                        on_resolve=_on_approval_resolve,
+                        source_info=f"Session: {session_key[:40]}",
+                    )
+                    if approval_result and approval_result.success:
+                        approval_note = (
+                            f"⏳ Dangerous command sent for approval to <#{approval_target}>."
+                        )
+                        _note_adapter = self.adapters.get(source.platform)
+                        if _note_adapter:
+                            _note_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                            await _note_adapter.send(
+                                source.chat_id, approval_note,
+                                metadata=_note_meta,
+                            )
+                        interactive_approval_sent = True
+                except Exception as e:
+                    logger.debug("send_exec_approval failed: %s", e)
+
+            # Fallback: send structured instructions as a separate message
+            # when interactive approval wasn't sent.
+            if not interactive_approval_sent:
+                cmd_preview = pending.get("command", "")
+                if len(cmd_preview) > 200:
+                    cmd_preview = cmd_preview[:200] + "..."
+                approval_hint = (
+                    f"⚠️ **Dangerous command requires approval:**\n"
+                    f"```\n{cmd_preview}\n```\n"
+                    f"Reply `/approve` to execute, `/approve session` to approve this pattern "
+                    f"for the session, or `/deny` to cancel."
+                )
+                _hint_adapter = self.adapters.get(source.platform)
+                if _hint_adapter:
+                    _hint_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                    await _hint_adapter.send(
+                        source.chat_id, approval_hint,
+                        metadata=_hint_meta,
+                    )
+
+        approval_monitor = asyncio.create_task(monitor_for_approvals())
+
         try:
             # Run in thread pool to not block
             loop = asyncio.get_event_loop()
@@ -6365,6 +6391,7 @@ class GatewayRunner:
             if progress_task:
                 progress_task.cancel()
             interrupt_monitor.cancel()
+            approval_monitor.cancel()
 
             # Wait for stream consumer to finish its final edit
             if stream_task:
@@ -6383,7 +6410,7 @@ class GatewayRunner:
                 del self._running_agents[session_key]
             
             # Wait for cancelled tasks
-            for task in [progress_task, interrupt_monitor, tracking_task]:
+            for task in [progress_task, interrupt_monitor, approval_monitor, tracking_task]:
                 if task:
                     try:
                         await task

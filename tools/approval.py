@@ -181,6 +181,14 @@ _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
 _permanent_approved: set = set()
 
+# Events for blocking until an approval is resolved.
+# Keyed by session_key; each entry is a threading.Event that is set()
+# when the user approves, denies, or the approval expires.
+_approval_events: dict[str, threading.Event] = {}
+# Stores the resolution for each pending approval so the waiter can
+# tell whether it was approved, denied, or expired.
+_approval_results: dict[str, str] = {}
+
 
 def submit_pending(session_key: str, approval: dict):
     """Store a pending approval request for a session."""
@@ -192,6 +200,54 @@ def pop_pending(session_key: str) -> Optional[dict]:
     """Retrieve and remove a pending approval for a session."""
     with _lock:
         return _pending.pop(session_key, None)
+
+
+def wait_for_approval(session_key: str, timeout: float = 300) -> str:
+    """Block the calling thread until the pending approval is resolved.
+
+    Call this from the sync agent loop after a tool returns approval_required.
+    The gateway (or CLI) will call resolve_approval() when the user responds.
+
+    Args:
+        session_key: Session key that has a pending approval.
+        timeout: Maximum seconds to wait (default 5 minutes).
+
+    Returns:
+        "approved", "denied", or "expired".
+    """
+    event = threading.Event()
+    with _lock:
+        _approval_events[session_key] = event
+    logger.debug("Approval wait started for session %s (timeout=%ss)",
+                 session_key[:16], timeout)
+    resolved = event.wait(timeout=timeout)
+    with _lock:
+        result = _approval_results.pop(session_key, "expired")
+        _approval_events.pop(session_key, None)
+    if not resolved:
+        logger.debug("Approval wait expired for session %s", session_key[:16])
+        return "expired"
+    logger.debug("Approval resolved for session %s: %s", session_key[:16], result)
+    return result
+
+
+def resolve_approval(session_key: str, result: str) -> None:
+    """Signal that a pending approval has been resolved.
+
+    Called by the gateway when the user approves/denies, or by a timeout
+    handler. Unblocks the thread waiting in wait_for_approval().
+
+    Args:
+        session_key: Session key with the pending approval.
+        result: "approved" or "denied".
+    """
+    with _lock:
+        _approval_results[session_key] = result
+        event = _approval_events.get(session_key)
+    if event:
+        event.set()
+        logger.debug("Approval event signaled for session %s: %s",
+                     session_key[:16], result)
 
 
 def has_pending(session_key: str) -> bool:

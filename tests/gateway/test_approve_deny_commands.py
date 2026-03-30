@@ -78,18 +78,19 @@ class TestApproveCommand:
 
     @pytest.mark.asyncio
     async def test_approve_executes_pending_command(self):
-        """Basic /approve executes the pending command."""
+        """Basic /approve signals the agent to continue with approval."""
         runner = _make_runner()
         source = _make_source()
         session_key = runner._session_key_for_source(source)
         runner._pending_approvals[session_key] = _make_pending_approval()
 
         event = _make_event("/approve")
-        with patch("tools.terminal_tool.terminal_tool", return_value="done") as mock_term:
+        with patch("tools.approval.resolve_approval") as mock_resolve:
             result = await runner._handle_approve_command(event)
 
-        assert "✅ Command approved and executed" in result
-        mock_term.assert_called_once_with(command="sudo rm -rf /tmp/test", force=True)
+        assert "✅ Command approved" in result
+        assert "agent continuing" in result
+        mock_resolve.assert_called_once_with(session_key, "approved")
         assert session_key not in runner._pending_approvals
 
     @pytest.mark.asyncio
@@ -102,7 +103,7 @@ class TestApproveCommand:
 
         event = _make_event("/approve session")
         with (
-            patch("tools.terminal_tool.terminal_tool", return_value="done"),
+            patch("tools.approval.resolve_approval"),
             patch("tools.approval.approve_session") as mock_session,
         ):
             result = await runner._handle_approve_command(event)
@@ -120,7 +121,7 @@ class TestApproveCommand:
 
         event = _make_event("/approve always")
         with (
-            patch("tools.terminal_tool.terminal_tool", return_value="done"),
+            patch("tools.approval.resolve_approval"),
             patch("tools.approval.approve_permanent") as mock_perm,
         ):
             result = await runner._handle_approve_command(event)
@@ -162,16 +163,18 @@ class TestDenyCommand:
 
     @pytest.mark.asyncio
     async def test_deny_clears_pending(self):
-        """/deny clears the pending approval."""
+        """""/deny clears the pending approval and signals denial."""
         runner = _make_runner()
         source = _make_source()
         session_key = runner._session_key_for_source(source)
         runner._pending_approvals[session_key] = _make_pending_approval()
 
         event = _make_event("/deny")
-        result = await runner._handle_deny_command(event)
+        with patch("tools.approval.resolve_approval") as mock_resolve:
+            result = await runner._handle_deny_command(event)
 
         assert "❌ Command denied" in result
+        mock_resolve.assert_called_once_with(session_key, "denied")
         assert session_key not in runner._pending_approvals
 
     @pytest.mark.asyncio
@@ -223,14 +226,14 @@ class TestBareTextNoLongerApproves:
 class TestApprovalHint:
 
     def test_approval_hint_appended_to_response(self):
-        """When a pending approval is collected, structured instructions
-        should be appended to the agent response."""
-        # This tests the approval collection logic at the end of _handle_message.
-        # We verify the hint format directly.
+        """When a pending approval is collected, the fallback hint should
+        contain structured instructions for the user."""
+        # This tests the approval hint format used when interactive
+        # approval isn't available (adapter doesn't support it).
         cmd = "sudo rm -rf /tmp/dangerous"
         cmd_preview = cmd
         hint = (
-            f"\n\n⚠️ **Dangerous command requires approval:**\n"
+            f"⚠️ **Dangerous command requires approval:**\n"
             f"```\n{cmd_preview}\n```\n"
             f"Reply `/approve` to execute, `/approve session` to approve this pattern "
             f"for the session, or `/deny` to cancel."
