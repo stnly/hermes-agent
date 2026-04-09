@@ -8,6 +8,7 @@ This module is the single source of truth for the dangerous command system:
 - Permanent allowlist persistence (config.yaml)
 """
 
+import contextvars
 import logging
 import os
 import re
@@ -17,6 +18,33 @@ import unicodedata
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# Per-thread/per-task gateway session identity.
+# Gateway runs agent turns concurrently in executor threads, so reading a
+# process-global env var for session identity is racy. Keep env fallback for
+# legacy single-threaded callers, but prefer the context-local value when set.
+_approval_session_key: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "approval_session_key",
+    default="",
+)
+
+
+def set_current_session_key(session_key: str) -> contextvars.Token[str]:
+    """Bind the active approval session key to the current context."""
+    return _approval_session_key.set(session_key or "")
+
+
+def reset_current_session_key(token: contextvars.Token[str]) -> None:
+    """Restore the prior approval session key context."""
+    _approval_session_key.reset(token)
+
+
+def get_current_session_key(default: str = "default") -> str:
+    """Return the active session key, preferring context-local state."""
+    session_key = _approval_session_key.get()
+    if session_key:
+        return session_key
+    return os.getenv("HERMES_SESSION_KEY", default)
 
 # Sensitive write targets that should trigger approval even when referenced
 # via shell expansions like $HOME or $HERMES_HOME.
@@ -75,41 +103,6 @@ DANGEROUS_PATTERNS = [
     (r'\b(cp|mv|install)\b.*\s/etc/', "copy/move file into /etc/"),
     (r'\bsed\s+-[^\s]*i.*\s/etc/', "in-place edit of system config"),
     (r'\bsed\s+--in-place\b.*\s/etc/', "in-place edit of system config (long flag)"),
-    # --- Terminal writes to cron jobs.json (use cronjob tool instead) ---
-    # Catches shell redirect (> or >>) to jobs.json
-    (r'>>?\s*.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/cron/jobs\.json',
-     "write to cron jobs.json (use cronjob tool instead)"),
-    # Catches tee writing to jobs.json
-    (r'\btee\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/cron/jobs\.json',
-     "write to cron jobs.json via tee (use cronjob tool instead)"),
-    # Catches python/perl/node -c/-e scripts writing to jobs.json
-    (r'\b(python[23]?|perl|node)\s+-[ce]\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/cron/jobs\.json',
-     "write to cron jobs.json via script (use cronjob tool instead)"),
-    # Catches jq modifying/writing jobs.json
-    (r'\bjq\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/cron/jobs\.json',
-     "modify cron jobs.json via jq (use cronjob tool instead)"),
-    # Catches cp/mv overwriting jobs.json
-    (r'\b(cp|mv)\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/cron/jobs\.json',
-     "overwrite cron jobs.json via cp/mv (use cronjob tool instead)"),
-    # Catches sed -i editing jobs.json
-    (r'\bsed\s+-i\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/cron/jobs\.json',
-     "edit cron jobs.json via sed (use cronjob tool instead)"),
-    # --- Memory protection (qmd-memory, memory store) ---
-    # Catches rm targeting QMD memory directory
-    (r'\brm\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/qmd-memory',
-     "delete QMD memory files (use memory/qmd tools instead)"),
-    # Catches rm targeting persistent memory directory
-    (r'\brm\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/memory',
-     "delete persistent memory files (use memory tool instead)"),
-    # Catches find -delete targeting memory directories
-    (r'\bfind\b.*-delete\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/(qmd-memory|memory)',
-     "find -delete on memory directory"),
-    # Catches shell redirect overwriting memory files
-    (r'>>?\s*.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/(qmd-memory|memory)/',
-     "overwrite memory file via redirect"),
-    # Catches tee overwriting memory files
-    (r'\btee\b.*((\$?\{?HOME\}?|~|/root)[/\\])?\.hermes/(qmd-memory|memory)/',
-     "overwrite memory file via tee"),
 ]
 
 
@@ -181,13 +174,93 @@ _pending: dict[str, dict] = {}
 _session_approved: dict[str, set] = {}
 _permanent_approved: set = set()
 
-# Events for blocking until an approval is resolved.
-# Keyed by session_key; each entry is a threading.Event that is set()
-# when the user approves, denies, or the approval expires.
-_approval_events: dict[str, threading.Event] = {}
-# Stores the resolution for each pending approval so the waiter can
-# tell whether it was approved, denied, or expired.
-_approval_results: dict[str, str] = {}
+# =========================================================================
+# Blocking gateway approval (mirrors CLI's synchronous input() flow)
+# =========================================================================
+# Per-session QUEUE of pending approvals.  Multiple threads (parallel
+# subagents, execute_code RPC handlers) can block concurrently — each gets
+# its own threading.Event.  /approve resolves the oldest, /approve all
+# resolves every pending approval in the session.
+
+
+class _ApprovalEntry:
+    """One pending dangerous-command approval inside a gateway session."""
+    __slots__ = ("event", "data", "result")
+
+    def __init__(self, data: dict):
+        self.event = threading.Event()
+        self.data = data          # command, description, pattern_keys, …
+        self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
+
+
+_gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
+_gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+
+
+def register_gateway_notify(session_key: str, cb) -> None:
+    """Register a per-session callback for sending approval requests to the user.
+
+    The callback signature is ``cb(approval_data: dict) -> None`` where
+    *approval_data* contains ``command``, ``description``, and
+    ``pattern_keys``.  The callback bridges sync→async (runs in the agent
+    thread, must schedule the actual send on the event loop).
+    """
+    with _lock:
+        _gateway_notify_cbs[session_key] = cb
+
+
+def unregister_gateway_notify(session_key: str) -> None:
+    """Unregister the per-session gateway approval callback.
+
+    Signals ALL blocked threads for this session so they don't hang forever
+    (e.g. when the agent run finishes or is interrupted).
+    """
+    with _lock:
+        _gateway_notify_cbs.pop(session_key, None)
+        entries = _gateway_queues.pop(session_key, [])
+        for entry in entries:
+            entry.event.set()
+
+
+def resolve_gateway_approval(session_key: str, choice: str,
+                             resolve_all: bool = False) -> int:
+    """Called by the gateway's /approve or /deny handler to unblock
+    waiting agent thread(s).
+
+    When *resolve_all* is True every pending approval in the session is
+    resolved at once (``/approve all``).  Otherwise only the oldest one
+    is resolved (FIFO).
+
+    Returns the number of approvals resolved (0 means nothing was pending).
+    """
+    with _lock:
+        queue = _gateway_queues.get(session_key)
+        if not queue:
+            return 0
+        if resolve_all:
+            targets = list(queue)
+            queue.clear()
+        else:
+            targets = [queue.pop(0)]
+        if not queue:
+            _gateway_queues.pop(session_key, None)
+
+    for entry in targets:
+        entry.result = choice
+        entry.event.set()
+    return len(targets)
+
+
+def has_blocking_approval(session_key: str) -> bool:
+    """Check if a session has one or more blocking gateway approvals waiting."""
+    with _lock:
+        return bool(_gateway_queues.get(session_key))
+
+
+def pending_approval_count(session_key: str) -> int:
+    """Return the number of pending blocking approvals for a session."""
+    with _lock:
+        return len(_gateway_queues.get(session_key, []))
 
 
 def submit_pending(session_key: str, approval: dict):
@@ -200,54 +273,6 @@ def pop_pending(session_key: str) -> Optional[dict]:
     """Retrieve and remove a pending approval for a session."""
     with _lock:
         return _pending.pop(session_key, None)
-
-
-def wait_for_approval(session_key: str, timeout: float = 300) -> str:
-    """Block the calling thread until the pending approval is resolved.
-
-    Call this from the sync agent loop after a tool returns approval_required.
-    The gateway (or CLI) will call resolve_approval() when the user responds.
-
-    Args:
-        session_key: Session key that has a pending approval.
-        timeout: Maximum seconds to wait (default 5 minutes).
-
-    Returns:
-        "approved", "denied", or "expired".
-    """
-    event = threading.Event()
-    with _lock:
-        _approval_events[session_key] = event
-    logger.debug("Approval wait started for session %s (timeout=%ss)",
-                 session_key[:16], timeout)
-    resolved = event.wait(timeout=timeout)
-    with _lock:
-        result = _approval_results.pop(session_key, "expired")
-        _approval_events.pop(session_key, None)
-    if not resolved:
-        logger.debug("Approval wait expired for session %s", session_key[:16])
-        return "expired"
-    logger.debug("Approval resolved for session %s: %s", session_key[:16], result)
-    return result
-
-
-def resolve_approval(session_key: str, result: str) -> None:
-    """Signal that a pending approval has been resolved.
-
-    Called by the gateway when the user approves/denies, or by a timeout
-    handler. Unblocks the thread waiting in wait_for_approval().
-
-    Args:
-        session_key: Session key with the pending approval.
-        result: "approved" or "denied".
-    """
-    with _lock:
-        _approval_results[session_key] = result
-        event = _approval_events.get(session_key)
-    if event:
-        event.set()
-        logger.debug("Approval event signaled for session %s: %s",
-                     session_key[:16], result)
 
 
 def has_pending(session_key: str) -> bool:
@@ -293,6 +318,11 @@ def clear_session(session_key: str):
     with _lock:
         _session_approved.pop(session_key, None)
         _pending.pop(session_key, None)
+        _gateway_notify_cbs.pop(session_key, None)
+        # Signal ALL blocked threads so they don't hang forever
+        entries = _gateway_queues.pop(session_key, [])
+        for entry in entries:
+            entry.event.set()
 
 
 # =========================================================================
@@ -532,7 +562,7 @@ def check_dangerous_command(command: str, env_type: str,
     if not is_dangerous:
         return {"approved": True, "message": None}
 
-    session_key = os.getenv("HERMES_SESSION_KEY", "default")
+    session_key = get_current_session_key()
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
@@ -658,7 +688,7 @@ def check_all_command_guards(command: str, env_type: str,
     # Collect warnings that need approval
     warnings = []  # list of (pattern_key, description, is_tirith)
 
-    session_key = os.getenv("HERMES_SESSION_KEY", "default")
+    session_key = get_current_session_key()
 
     # Tirith block/warn → approvable warning with rich findings.
     # Previously, tirith "block" was a hard block with no approval prompt.
@@ -694,7 +724,8 @@ def check_all_command_guards(command: str, env_type: str,
             logger.debug("Smart approval: auto-approved '%s' (%s)",
                          command[:60], combined_desc_for_llm)
             return {"approved": True, "message": None,
-                    "smart_approved": True}
+                    "smart_approved": True,
+                    "description": combined_desc_for_llm}
         elif verdict == "deny":
             combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
             return {
@@ -713,13 +744,93 @@ def check_all_command_guards(command: str, env_type: str,
     all_keys = [key for key, _, _ in warnings]
     has_tirith = any(is_t for _, _, is_t in warnings)
 
-    # Gateway/async: single approval_required with combined description
-    # Store all pattern keys so gateway replay approves all of them
+    # Gateway/async approval — block the agent thread until the user
+    # responds with /approve or /deny, mirroring the CLI's synchronous
+    # input() flow.  The agent never sees "approval_required"; it either
+    # gets the command output (approved) or a definitive "BLOCKED" message.
     if is_gateway or is_ask:
+        notify_cb = None
+        with _lock:
+            notify_cb = _gateway_notify_cbs.get(session_key)
+
+        if notify_cb is not None:
+            # --- Blocking gateway approval (queue-based) ---
+            # Each call gets its own _ApprovalEntry so parallel subagents
+            # and execute_code threads can block concurrently.
+            approval_data = {
+                "command": command,
+                "pattern_key": primary_key,
+                "pattern_keys": all_keys,
+                "description": combined_desc,
+            }
+            entry = _ApprovalEntry(approval_data)
+            with _lock:
+                _gateway_queues.setdefault(session_key, []).append(entry)
+
+            # Notify the user (bridges sync agent thread → async gateway)
+            try:
+                notify_cb(approval_data)
+            except Exception as exc:
+                logger.warning("Gateway approval notify failed: %s", exc)
+                with _lock:
+                    queue = _gateway_queues.get(session_key, [])
+                    if entry in queue:
+                        queue.remove(entry)
+                    if not queue:
+                        _gateway_queues.pop(session_key, None)
+                return {
+                    "approved": False,
+                    "message": "BLOCKED: Failed to send approval request to user. Do NOT retry.",
+                    "pattern_key": primary_key,
+                    "description": combined_desc,
+                }
+
+            # Block until the user responds or timeout (default 5 min)
+            timeout = _get_approval_config().get("gateway_timeout", 300)
+            try:
+                timeout = int(timeout)
+            except (ValueError, TypeError):
+                timeout = 300
+            resolved = entry.event.wait(timeout=timeout)
+
+            # Clean up this entry from the queue
+            with _lock:
+                queue = _gateway_queues.get(session_key, [])
+                if entry in queue:
+                    queue.remove(entry)
+                if not queue:
+                    _gateway_queues.pop(session_key, None)
+
+            choice = entry.result
+            if not resolved or choice is None or choice == "deny":
+                reason = "timed out" if not resolved else "denied by user"
+                return {
+                    "approved": False,
+                    "message": f"BLOCKED: Command {reason}. Do NOT retry this command.",
+                    "pattern_key": primary_key,
+                    "description": combined_desc,
+                }
+
+            # User approved — persist based on scope (same logic as CLI)
+            for key, _, is_tirith in warnings:
+                if choice == "session" or (choice == "always" and is_tirith):
+                    approve_session(session_key, key)
+                elif choice == "always":
+                    approve_session(session_key, key)
+                    approve_permanent(key)
+                    save_permanent_allowlist(_permanent_approved)
+                # choice == "once": no persistence — command allowed this
+                # single time only, matching the CLI's behavior.
+
+            return {"approved": True, "message": None,
+                    "user_approved": True, "description": combined_desc}
+
+        # Fallback: no gateway callback registered (e.g. cron, batch).
+        # Return approval_required for backward compat.
         submit_pending(session_key, {
             "command": command,
-            "pattern_key": primary_key,        # backward compat
-            "pattern_keys": all_keys,           # all keys for replay
+            "pattern_key": primary_key,
+            "pattern_keys": all_keys,
             "description": combined_desc,
         })
         return {
@@ -758,4 +869,9 @@ def check_all_command_guards(command: str, env_type: str,
             approve_permanent(key)
             save_permanent_allowlist(_permanent_approved)
 
-    return {"approved": True, "message": None}
+    return {"approved": True, "message": None,
+            "user_approved": True, "description": combined_desc}
+
+
+# Load permanent allowlist from config on module import
+load_permanent_allowlist()
