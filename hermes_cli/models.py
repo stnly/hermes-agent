@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import urllib.request
 import urllib.error
 from difflib import get_close_matches
@@ -123,6 +124,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gemma-4-26b-it",
     ],
     "zai": [
+        "glm-5.1",
         "glm-5",
         "glm-5-turbo",
         "glm-4.7",
@@ -923,12 +925,63 @@ def detect_provider_for_model(
         return None
 
     # --- Step 1: check static provider catalogs for a direct match ---
+    # Also handle vendor/model format: strip the vendor prefix and
+    # resolve it to a provider, then check that provider's catalog.
+    # e.g. "zai/glm-5.1" -> provider=zai, bare="glm-5.1" -> match zai catalog
+    _input_vendor = ""
+    _input_bare = name_lower
+    if "/" in name_lower:
+        _v, _b = name_lower.split("/", 1)
+        _resolved_v = _PROVIDER_ALIASES.get(_v, _v)
+        if _resolved_v in _PROVIDER_LABELS or _resolved_v in _PROVIDER_MODELS:
+            _input_vendor = _resolved_v
+            _input_bare = _b
+
     direct_match: Optional[str] = None
+    direct_match_model: Optional[str] = None
     for pid, models in _PROVIDER_MODELS.items():
         if pid == current_provider or pid in _AGGREGATORS:
             continue
         if any(name_lower == m.lower() for m in models):
             direct_match = pid
+            direct_match_model = name
+            break
+        # Also match with vendor prefix stripped (zai/glm-5.1 -> glm-5.1)
+        if _input_vendor == pid:
+            for m in models:
+                if _input_bare == m.lower():
+                    direct_match = pid
+                    direct_match_model = m
+                    break
+            if direct_match:
+                break
+        # Prefix match: bare model name starts with a catalog entry's
+        # family prefix (e.g. "glm-5.2" matches "glm" from "glm-5" -> zai,
+        # "deepseek-v4" matches "deepseek" from "deepseek-chat" -> deepseek).
+        # This handles future models not yet in the static catalog.
+        _bare_for_match = _input_bare if _input_vendor else name_lower
+        if _bare_for_match and not direct_match:
+            _family_match = re.match(r'^([a-z]+(?:-[a-z]+)*)', _bare_for_match)
+            if _family_match:
+                _family_prefix = _family_match.group(1) + "-"
+                _matching_providers = []
+                for _pid, _models in _PROVIDER_MODELS.items():
+                    if _pid in _AGGREGATORS or _pid == current_provider:
+                        continue
+                    if any(_family_prefix and m.lower().startswith(_family_prefix) for m in _models if m):
+                        _matching_providers.append(_pid)
+                # If unambiguous, use directly
+                if len(_matching_providers) == 1:
+                    direct_match = _matching_providers[0]
+                    direct_match_model = _bare_for_match
+                # If ambiguous, prefer the canonical provider for this family
+                # via _PROVIDER_ALIASES (e.g. glm -> zai, claude -> anthropic)
+                elif len(_matching_providers) > 1:
+                    _canonical = _PROVIDER_ALIASES.get(_family_match.group(1))
+                    if _canonical and _canonical in _matching_providers:
+                        direct_match = _canonical
+                        direct_match_model = _bare_for_match
+        if direct_match:
             break
 
     if direct_match:
@@ -947,15 +1000,15 @@ def detect_provider_for_model(
             pass
 
         if has_creds:
-            return (direct_match, name)
+            return (direct_match, direct_match_model)
 
         # No direct creds — try to find this model on OpenRouter instead
-        or_slug = _find_openrouter_slug(name)
+        or_slug = _find_openrouter_slug(direct_match_model)
         if or_slug:
             return ("openrouter", or_slug)
         # Still return the direct provider — credential resolution will
         # give a clear error rather than silently using the wrong provider
-        return (direct_match, name)
+        return (direct_match, direct_match_model)
 
     # --- Step 2: check OpenRouter catalog ---
     # First try exact match (handles provider/model format)

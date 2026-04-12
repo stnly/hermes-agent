@@ -568,6 +568,40 @@ def switch_model(
                             if bare.lower() == new_model_lower:
                                 new_model = mid
                                 break
+                # Vendor-prefix normalization: if the user typed
+                # "zai/glm-5.1" but the catalog has "z-ai/glm-5.1",
+                # normalize using the provider alias map.
+                if "/" in new_model:
+                    vendor, bare = new_model.split("/", 1)
+                    from hermes_cli.models import _PROVIDER_ALIASES
+                    # Build reverse map: canonical -> set of aliases + canonical
+                    # e.g. zai -> {zai, z-ai, z.ai, glm, zhipu}
+                    canon_to_aliases: dict[str, set[str]] = {}
+                    for alias, canon in _PROVIDER_ALIASES.items():
+                        canon_to_aliases.setdefault(canon, set()).add(alias)
+                        canon_to_aliases[canon].add(canon)
+                    # Try all vendor aliases against the catalog
+                    vendor_lower = vendor.lower()
+                    for mid in catalog:
+                        if "/" not in mid:
+                            continue
+                        cat_vendor, cat_bare = mid.split("/", 1)
+                        cat_vendor_lower = cat_vendor.lower()
+                        if cat_bare.lower() != bare.lower():
+                            continue
+                        # Direct match
+                        if cat_vendor_lower == vendor_lower:
+                            new_model = mid
+                            break
+                        # Alias match (zai <-> z-ai)
+                        if vendor_lower in canon_to_aliases:
+                            if cat_vendor_lower in canon_to_aliases[vendor_lower]:
+                                new_model = mid
+                                break
+                        elif cat_vendor_lower in canon_to_aliases:
+                            if vendor_lower in canon_to_aliases[cat_vendor_lower]:
+                                new_model = mid
+                                break
 
         # --- Step e: detect_provider_for_model() as last resort ---
         _base = current_base_url or ""
